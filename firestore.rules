@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAnonymous() {
+      return isAuthenticated() && request.auth.token.firebase.sign_in_provider == 'anonymous';
+    }
+
+    function isRoomActive(roomId) {
+      return exists(/databases/$(database)/documents/rooms/$(roomId)) &&
+        get(/databases/$(database)/documents/rooms/$(roomId)).data.status == 'active';
+    }
+
+    function isHost(roomId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/rooms/$(roomId)) &&
+        get(/databases/$(database)/documents/rooms/$(roomId)).data.hostUid == request.auth.uid;
+    }
+
+    function hasJoinRequest(roomId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/rooms/$(roomId)/requests/$(request.auth.uid));
+    }
+
+    function isApprovedParticipant(roomId) {
+      return isHost(roomId) || (
+        isAuthenticated() &&
+        exists(/databases/$(database)/documents/rooms/$(roomId)/participants/$(request.auth.uid))
+      );
+    }
+
+    function isApprovedGuest(roomId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/rooms/$(roomId)/requests/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/rooms/$(roomId)/requests/$(request.auth.uid)).data.status == 'approved';
+    }
+
+    // Room Document
+    match /rooms/{roomId} {
+      // Host can read; Guests can read ONLY if they have created a join request for this room
+      allow get: if isAuthenticated() && (
+        resource.data.hostUid == request.auth.uid ||
+        hasJoinRequest(roomId)
+      );
+
+      allow create: if isAnonymous()
+                    && request.resource.data.hostUid == request.auth.uid
+                    && request.resource.data.status == 'active'
+                    && request.resource.data.createdAt is timestamp;
+
+      allow update: if isAuthenticated()
+                    && resource.data.hostUid == request.auth.uid
+                    && request.resource.data.hostUid == resource.data.hostUid
+                    && request.resource.data.status in ['active', 'ended'];
+
+      // Join Requests Subcollection
+      match /requests/{requestId} {
+        allow read: if isHost(roomId) || (isAuthenticated() && request.auth.uid == requestId);
+
+        // Guest creates request ONLY when room exists, is active, anonymous, and for self
+        allow create: if isAnonymous()
+                      && isRoomActive(roomId)
+                      && request.auth.uid == requestId
+                      && request.resource.data.status == 'pending'
+                      && request.resource.data.displayName is string;
+
+        allow update: if isHost(roomId)
+                      && request.resource.data.status in ['approved', 'denied'];
+
+        allow delete: if isHost(roomId) || (isAuthenticated() && request.auth.uid == requestId);
+      }
+
+      // Participants Subcollection
+      match /participants/{participantId} {
+        allow read: if isApprovedParticipant(roomId) || isApprovedGuest(roomId);
+
+        allow create, update: if isAuthenticated()
+                              && isRoomActive(roomId)
+                              && request.auth.uid == participantId
+                              && (isHost(roomId) || isApprovedGuest(roomId))
+                              && request.resource.data.displayName is string;
+
+        allow delete: if isAuthenticated() && (request.auth.uid == participantId || isHost(roomId));
+      }
+
+      // Transient WebRTC Signaling Subcollection
+      match /signals/{signalId} {
+        allow read: if isApprovedParticipant(roomId);
+
+        allow create: if isRoomActive(roomId)
+                      && isApprovedParticipant(roomId)
+                      && request.resource.data.from == request.auth.uid
+                      && request.resource.data.to is string
+                      && request.resource.data.type in ['offer', 'answer', 'candidate'];
+
+        allow delete: if isAuthenticated() && (
+          resource.data.to == request.auth.uid ||
+          resource.data.from == request.auth.uid ||
+          isHost(roomId)
+        );
+      }
+    }
+  }
+}
