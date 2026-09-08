@@ -1,97 +1,92 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   collection,
-  doc,
-  setDoc,
-  getDoc,
-  updateDoc,
   deleteDoc,
+  doc,
+  getDoc,
   onSnapshot,
   query,
-  where,
-  serverTimestamp
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where
 } from 'firebase/firestore';
 import { db, initAuth } from './firebase';
 import { ICE_SERVERS, generateRoomId } from './webrtc';
 import {
+  AlertCircle,
+  Check,
+  Copy,
   Mic,
   MicOff,
-  Video as VideoIcon,
-  VideoOff,
   PhoneOff,
-  Copy,
-  Check,
-  Users,
   ShieldCheck,
   UserCheck,
   UserX,
-  AlertCircle
+  Users,
+  Video as VideoIcon,
+  VideoOff
 } from 'lucide-react';
 
 export default function App() {
-  // Auth state
   const [currentUser, setCurrentUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
-
-  // Navigation & Room state
   const [roomId, setRoomId] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [isHost, setIsHost] = useState(false);
-  const [appState, setAppState] = useState('home'); // 'home' | 'requesting' | 'waiting' | 'denied' | 'meeting' | 'ended'
-
-  // Media state
+  const [appState, setAppState] = useState('home');
   const [localStream, setLocalStream] = useState(null);
   const [isMicOn, setIsMicOn] = useState(true);
   const [isCamOn, setIsCamOn] = useState(true);
-  const [remoteStreams, setRemoteStreams] = useState({}); // { [peerId]: { stream } }
+  const [remoteStreams, setRemoteStreams] = useState({});
   const [participants, setParticipants] = useState({});
-
-  // Host state
+  const [connectionStates, setConnectionStates] = useState({});
   const [pendingRequests, setPendingRequests] = useState([]);
   const [copiedLink, setCopiedLink] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
-  // WebRTC refs
-  const peerConnections = useRef({}); // { [peerId]: RTCPeerConnection }
-  const candidateQueues = useRef({}); // { [peerId]: [candidate] }
+  const peerConnections = useRef({});
+  const candidateQueues = useRef({});
   const localStreamRef = useRef(null);
+  const currentUserRef = useRef(null);
+  const roomIdRef = useRef('');
 
-  // 1. Silent anonymous authentication & URL param parsing on startup
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+
+  useEffect(() => {
+    roomIdRef.current = roomId;
+  }, [roomId]);
+
   useEffect(() => {
     initAuth()
-      .then((user) => {
+      .then(async (user) => {
         setCurrentUser(user);
+        currentUserRef.current = user;
         setAuthReady(true);
 
-        const params = new URLSearchParams(window.location.search);
-        const roomParam = params.get('room');
-        if (roomParam) {
-          const formattedRoom = roomParam.toLowerCase().trim();
-          setRoomId(formattedRoom);
+        const roomParam = new URLSearchParams(window.location.search).get('room');
+        if (!roomParam) return;
 
-          // Check if this user is the host returning to their room
-          getDoc(doc(db, 'rooms', formattedRoom))
-            .then((snap) => {
-              if (snap.exists()) {
-                const roomData = snap.data();
-                if (roomData.hostUid === user.uid) {
-                  setIsHost(true);
-                }
-              }
-              setAppState('requesting');
-            })
-            .catch(() => {
-              setAppState('requesting');
-            });
+        const formattedRoom = roomParam.toLowerCase().trim();
+        setRoomId(formattedRoom);
+        roomIdRef.current = formattedRoom;
+
+        try {
+          const snap = await getDoc(doc(db, 'rooms', formattedRoom));
+          if (snap.exists() && snap.data().hostUid === user.uid) setIsHost(true);
+        } catch (err) {
+          console.error('Room lookup failed:', err);
         }
+        setAppState('requesting');
       })
       .catch((err) => {
-        console.error('Silent auth error:', err);
-        setErrorMsg('Authentication error. Ensure Anonymous Auth is enabled in Firebase Console.');
+        console.error('Anonymous auth failed:', err);
+        setErrorMsg('Authentication failed. Check Firebase Anonymous Auth.');
       });
   }, []);
 
-  // 2. Host creates a new meeting
   const handleCreateMeeting = async (e) => {
     e.preventDefault();
     if (!displayName.trim() || !currentUser) return;
@@ -99,8 +94,6 @@ export default function App() {
 
     try {
       const newRoomId = generateRoomId();
-
-      // Create room with host's authenticated anonymous UID
       await setDoc(doc(db, 'rooms', newRoomId), {
         status: 'active',
         hostUid: currentUser.uid,
@@ -108,67 +101,67 @@ export default function App() {
       });
 
       setRoomId(newRoomId);
+      roomIdRef.current = newRoomId;
       setIsHost(true);
       window.history.pushState({}, '', `?room=${newRoomId}`);
       await startMeetingRoom(newRoomId, displayName.trim(), true);
     } catch (err) {
-      console.error('Error creating meeting:', err);
-      setErrorMsg('Failed to create meeting. Check Firestore rules & config.');
+      console.error('Create meeting failed:', err);
+      setErrorMsg('Failed to create meeting. Check Firestore rules.');
     }
   };
 
-  // 3. Guest submits join request
   const handleRequestJoin = async (e) => {
     e.preventDefault();
     if (!displayName.trim() || !roomId.trim() || !currentUser) return;
     setErrorMsg('');
 
     const targetRoomId = roomId.trim();
+    const requestRef = doc(db, 'rooms', targetRoomId, 'requests', currentUser.uid);
 
     try {
-      // Submit join request keyed by guest's own anonymous UID
-      // (Firestore rules verify room existence & active status on create)
-      const requestRef = doc(db, 'rooms', targetRoomId, 'requests', currentUser.uid);
+      if (isHost) {
+        await startMeetingRoom(targetRoomId, displayName.trim(), true);
+        return;
+      }
+
       await setDoc(requestRef, {
         displayName: displayName.trim(),
         status: 'pending',
         createdAt: serverTimestamp()
       });
-
       setAppState('waiting');
 
-      // Listen for host decision on guest's request document
       const unsub = onSnapshot(requestRef, async (snap) => {
-        if (snap.exists()) {
-          const data = snap.data();
-          if (data.status === 'approved') {
-            unsub();
-            await startMeetingRoom(targetRoomId, displayName.trim(), false);
-          } else if (data.status === 'denied') {
-            unsub();
-            setAppState('denied');
-          }
+        if (!snap.exists()) return;
+        const data = snap.data();
+        if (data.status === 'approved') {
+          unsub();
+          await startMeetingRoom(targetRoomId, displayName.trim(), false);
+        } else if (data.status === 'denied') {
+          unsub();
+          setAppState('denied');
         }
       });
     } catch (err) {
-      console.error('Error requesting join:', err);
-      setErrorMsg('Meeting does not exist, has ended, or join request was blocked.');
+      console.error('Join request failed:', err);
+      setErrorMsg('Meeting does not exist, has ended, or access was blocked.');
     }
   };
 
-  // 4. Enter and initialize WebRTC stream + Firestore participant record
   const startMeetingRoom = async (activeRoomId, name, hostFlag) => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: true
       });
-      setLocalStream(stream);
-      localStreamRef.current = stream;
 
-      // Add self to room's participants collection
-      const selfRef = doc(db, 'rooms', activeRoomId, 'participants', currentUser.uid);
-      await setDoc(selfRef, {
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+      setIsMicOn(stream.getAudioTracks().some((t) => t.enabled));
+      setIsCamOn(stream.getVideoTracks().some((t) => t.enabled));
+
+      await setDoc(doc(db, 'rooms', activeRoomId, 'participants', currentUser.uid), {
         participantId: currentUser.uid,
         displayName: name,
         isHost: hostFlag,
@@ -178,64 +171,158 @@ export default function App() {
       setAppState('meeting');
     } catch (err) {
       console.error('Media permission failed:', err);
-      setErrorMsg('Camera and microphone permission required to join.');
+      setErrorMsg(err?.name === 'NotAllowedError'
+        ? 'Please allow camera and microphone access in your browser.'
+        : 'Could not access camera and microphone.');
     }
   };
 
-  // 5. Active meeting room realtime subscriptions & WebRTC mesh signaling
+  const setPeerStatus = (peerId, status) => {
+    setConnectionStates((prev) => ({ ...prev, [peerId]: status }));
+  };
+
+  const removeRemotePeer = (peerId) => {
+    setRemoteStreams((prev) => {
+      const next = { ...prev };
+      delete next[peerId];
+      return next;
+    });
+  };
+
+  const closePeerConnection = (peerId, clearRemote = true) => {
+    const pc = peerConnections.current[peerId];
+    if (pc) {
+      pc.ontrack = null;
+      pc.onicecandidate = null;
+      pc.oniceconnectionstatechange = null;
+      pc.onconnectionstatechange = null;
+      pc.close();
+      delete peerConnections.current[peerId];
+    }
+    delete candidateQueues.current[peerId];
+    if (clearRemote) removeRemotePeer(peerId);
+    setConnectionStates((prev) => {
+      const next = { ...prev };
+      delete next[peerId];
+      return next;
+    });
+  };
+
+  const createPeerConnection = (peerId, makeOffer) => {
+    if (peerConnections.current[peerId]) return peerConnections.current[peerId];
+
+    const user = currentUserRef.current;
+    const activeRoom = roomIdRef.current;
+    if (!user || !activeRoom || !localStreamRef.current) return null;
+
+    const pc = new RTCPeerConnection(ICE_SERVERS);
+    peerConnections.current[peerId] = pc;
+    candidateQueues.current[peerId] ||= [];
+    setPeerStatus(peerId, 'connecting');
+
+    localStreamRef.current.getTracks().forEach((track) => {
+      pc.addTrack(track, localStreamRef.current);
+    });
+
+    pc.ontrack = (event) => {
+      const stream = event.streams?.[0];
+      if (!stream) return;
+      setRemoteStreams((prev) => ({ ...prev, [peerId]: { stream } }));
+      setPeerStatus(peerId, 'connected');
+    };
+
+    pc.onicecandidate = async (event) => {
+      if (!event.candidate) return;
+      try {
+        await setDoc(doc(collection(db, 'rooms', activeRoom, 'signals')), {
+          from: user.uid,
+          to: peerId,
+          type: 'candidate',
+          candidate: event.candidate.toJSON(),
+          createdAt: serverTimestamp()
+        });
+      } catch (err) {
+        console.error('ICE candidate send failed:', err);
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const state = pc.iceConnectionState;
+      setPeerStatus(peerId, state === 'completed' ? 'connected' : state);
+      console.log('[WebRTC]', user.uid, '->', peerId, 'ICE:', state);
+
+      if (state === 'failed') {
+        setPeerStatus(peerId, 'failed');
+        if (user.uid > peerId && peerConnections.current[peerId] === pc) {
+          closePeerConnection(peerId);
+          setTimeout(() => createPeerConnection(peerId, true), 800);
+        }
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+      console.log('[WebRTC]', user.uid, '->', peerId, 'connection:', state);
+      if (state === 'connected') setPeerStatus(peerId, 'connected');
+      if (state === 'disconnected') setPeerStatus(peerId, 'disconnected');
+      if (state === 'failed') setPeerStatus(peerId, 'failed');
+    };
+
+    if (makeOffer) {
+      pc.createOffer()
+        .then((offer) => pc.setLocalDescription(offer))
+        .then(() => setDoc(doc(collection(db, 'rooms', activeRoom, 'signals')), {
+          from: user.uid,
+          to: peerId,
+          type: 'offer',
+          sdp: pc.localDescription.sdp,
+          createdAt: serverTimestamp()
+        }))
+        .catch((err) => console.error('Offer creation failed:', err));
+    }
+
+    return pc;
+  };
+
   useEffect(() => {
     if (appState !== 'meeting' || !roomId || !currentUser) return;
 
-    // A. Listen to room status (e.g. host ended meeting)
     const roomUnsub = onSnapshot(doc(db, 'rooms', roomId), (snap) => {
-      if (snap.exists() && snap.data().status === 'ended') {
-        leaveMeeting('Meeting ended by host.');
-      }
+      if (snap.exists() && snap.data().status === 'ended') leaveMeeting('Meeting ended by host.');
     });
 
-    // B. Host listens to pending guest join requests
     let requestsUnsub = () => {};
     if (isHost) {
-      const q = query(
+      const requestsQuery = query(
         collection(db, 'rooms', roomId, 'requests'),
         where('status', '==', 'pending')
       );
-      requestsUnsub = onSnapshot(q, (snapshot) => {
-        const reqs = [];
-        snapshot.forEach((d) => reqs.push({ id: d.id, ...d.data() }));
-        setPendingRequests(reqs);
+      requestsUnsub = onSnapshot(requestsQuery, (snapshot) => {
+        setPendingRequests(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
       });
     }
 
-    // C. Listen to all participants in this meeting
     const participantsUnsub = onSnapshot(
       collection(db, 'rooms', roomId, 'participants'),
       (snapshot) => {
-        const currentParticipants = {};
-        snapshot.forEach((d) => {
-          currentParticipants[d.id] = d.data();
-        });
-        setParticipants(currentParticipants);
+        const next = {};
+        snapshot.forEach((d) => { next[d.id] = d.data(); });
+        setParticipants(next);
 
-        // Deterministic WebRTC connection initiator: higher UID creates offer
-        Object.keys(currentParticipants).forEach((peerId) => {
-          if (peerId !== currentUser.uid) {
-            if (currentUser.uid > peerId && !peerConnections.current[peerId]) {
-              initiatePeerConnection(peerId, true);
-            }
+        Object.keys(next).forEach((peerId) => {
+          if (peerId === currentUser.uid) return;
+          // One deterministic initiator prevents offer collisions.
+          if (currentUser.uid > peerId && !peerConnections.current[peerId]) {
+            createPeerConnection(peerId, true);
           }
         });
 
-        // Clean up connections for participants who left
         Object.keys(peerConnections.current).forEach((peerId) => {
-          if (!currentParticipants[peerId]) {
-            closePeerConnection(peerId);
-          }
+          if (!next[peerId]) closePeerConnection(peerId);
         });
       }
     );
 
-    // D. Listen to incoming WebRTC signaling messages targeted to this user
     const signalsQuery = query(
       collection(db, 'rooms', roomId, 'signals'),
       where('to', '==', currentUser.uid)
@@ -243,63 +330,65 @@ export default function App() {
 
     const signalsUnsub = onSnapshot(signalsQuery, async (snapshot) => {
       for (const change of snapshot.docChanges()) {
-        if (change.type === 'added') {
-          const signalDoc = change.doc;
-          const signal = signalDoc.data();
-          const fromPeerId = signal.from;
+        if (change.type !== 'added') continue;
+        const signalDoc = change.doc;
+        const signal = signalDoc.data();
+        const peerId = signal.from;
 
-          try {
-            if (signal.type === 'offer') {
-              const pc = initiatePeerConnection(fromPeerId, false);
-              await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: signal.sdp }));
+        try {
+          if (signal.type === 'offer') {
+            let pc = peerConnections.current[peerId];
+            if (!pc) pc = createPeerConnection(peerId, false);
+            if (!pc) continue;
 
-              // Drain any queued ICE candidates
-              if (candidateQueues.current[fromPeerId]) {
-                for (const candidate of candidateQueues.current[fromPeerId]) {
-                  await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                }
-                candidateQueues.current[fromPeerId] = [];
-              }
+            await pc.setRemoteDescription(new RTCSessionDescription({
+              type: 'offer',
+              sdp: signal.sdp
+            }));
 
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
+            const queued = candidateQueues.current[peerId] || [];
+            for (const candidate of queued) await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            candidateQueues.current[peerId] = [];
 
-              // Post answer back to Firestore
-              await setDoc(doc(collection(db, 'rooms', roomId, 'signals')), {
-                from: currentUser.uid,
-                to: fromPeerId,
-                type: 'answer',
-                sdp: answer.sdp,
-                createdAt: serverTimestamp()
-              });
-            } else if (signal.type === 'answer') {
-              const pc = peerConnections.current[fromPeerId];
-              if (pc) {
-                await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signal.sdp }));
-
-                if (candidateQueues.current[fromPeerId]) {
-                  for (const candidate of candidateQueues.current[fromPeerId]) {
-                    await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                  }
-                  candidateQueues.current[fromPeerId] = [];
-                }
-              }
-            } else if (signal.type === 'candidate') {
-              const pc = peerConnections.current[fromPeerId];
-              const candidate = signal.candidate;
-              if (pc && pc.remoteDescription && pc.remoteDescription.type) {
-                await pc.addIceCandidate(new RTCIceCandidate(candidate));
-              } else {
-                if (!candidateQueues.current[fromPeerId]) candidateQueues.current[fromPeerId] = [];
-                candidateQueues.current[fromPeerId].push(candidate);
-              }
-            }
-
-            // Immediately delete consumed signaling doc to keep Firestore free tier usage near zero
-            await deleteDoc(signalDoc.ref);
-          } catch (err) {
-            console.error('Signal processing error:', err);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await setDoc(doc(collection(db, 'rooms', roomId, 'signals')), {
+              from: currentUser.uid,
+              to: peerId,
+              type: 'answer',
+              sdp: answer.sdp,
+              createdAt: serverTimestamp()
+            });
           }
+
+          if (signal.type === 'answer') {
+            const pc = peerConnections.current[peerId];
+            if (pc && !pc.currentRemoteDescription) {
+              await pc.setRemoteDescription(new RTCSessionDescription({
+                type: 'answer',
+                sdp: signal.sdp
+              }));
+
+              const queued = candidateQueues.current[peerId] || [];
+              for (const candidate of queued) await pc.addIceCandidate(new RTCIceCandidate(candidate));
+              candidateQueues.current[peerId] = [];
+            }
+          }
+
+          if (signal.type === 'candidate') {
+            const candidate = signal.candidate;
+            const pc = peerConnections.current[peerId];
+            if (!pc || !pc.remoteDescription) {
+              candidateQueues.current[peerId] ||= [];
+              candidateQueues.current[peerId].push(candidate);
+            } else {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            }
+          }
+
+          await deleteDoc(signalDoc.ref);
+        } catch (err) {
+          console.error('Signal processing error:', signal.type, err);
         }
       }
     });
@@ -312,385 +401,159 @@ export default function App() {
     };
   }, [appState, roomId, isHost, currentUser]);
 
-  // PeerConnection factory
-  const initiatePeerConnection = (peerId, isOfferInitiator) => {
-    if (peerConnections.current[peerId]) {
-      return peerConnections.current[peerId];
-    }
-
-    const pc = new RTCPeerConnection(ICE_SERVERS);
-    peerConnections.current[peerId] = pc;
-
-    // Attach local media tracks
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current);
-      });
-    }
-
-    // Handle remote media stream
-    pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        setRemoteStreams((prev) => ({
-          ...prev,
-          [peerId]: {
-            stream: event.streams[0]
-          }
-        }));
-      }
-    };
-
-    // Emit local ICE candidate to Firestore
-    pc.onicecandidate = async (event) => {
-      if (event.candidate && currentUser) {
-        try {
-          await setDoc(doc(collection(db, 'rooms', roomId, 'signals')), {
-            from: currentUser.uid,
-            to: peerId,
-            type: 'candidate',
-            candidate: event.candidate.toJSON(),
-            createdAt: serverTimestamp()
-          });
-        } catch (err) {
-          console.error('Failed to send ICE candidate:', err);
-        }
-      }
-    };
-
-    // If initiator, generate SDP offer
-    if (isOfferInitiator) {
-      pc.createOffer()
-        .then((offer) => pc.setLocalDescription(offer))
-        .then(async () => {
-          await setDoc(doc(collection(db, 'rooms', roomId, 'signals')), {
-            from: currentUser.uid,
-            to: peerId,
-            type: 'offer',
-            sdp: pc.localDescription.sdp,
-            createdAt: serverTimestamp()
-          });
-        })
-        .catch((err) => console.error('Error creating offer:', err));
-    }
-
-    return pc;
-  };
-
-  const closePeerConnection = (peerId) => {
-    if (peerConnections.current[peerId]) {
-      peerConnections.current[peerId].close();
-      delete peerConnections.current[peerId];
-    }
-    setRemoteStreams((prev) => {
-      const copy = { ...prev };
-      delete copy[peerId];
-      return copy;
-    });
-  };
-
-  // Host allows guest
   const handleAllowGuest = async (requestId) => {
     try {
-      await updateDoc(doc(db, 'rooms', roomId, 'requests', requestId), {
-        status: 'approved'
-      });
+      await updateDoc(doc(db, 'rooms', roomId, 'requests', requestId), { status: 'approved' });
     } catch (err) {
-      console.error('Failed to approve guest:', err);
+      console.error('Approve failed:', err);
     }
   };
 
-  // Host denies guest
   const handleDenyGuest = async (requestId) => {
     try {
-      await updateDoc(doc(db, 'rooms', roomId, 'requests', requestId), {
-        status: 'denied'
-      });
+      await updateDoc(doc(db, 'rooms', roomId, 'requests', requestId), { status: 'denied' });
     } catch (err) {
-      console.error('Failed to deny guest:', err);
+      console.error('Deny failed:', err);
     }
   };
 
-  // Media toggles
   const toggleMic = () => {
-    if (localStreamRef.current) {
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        setIsMicOn(audioTrack.enabled);
-      }
-    }
+    const track = localStreamRef.current?.getAudioTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    setIsMicOn(track.enabled);
   };
 
   const toggleCam = () => {
-    if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled;
-        setIsCamOn(videoTrack.enabled);
-      }
-    }
+    const track = localStreamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    setIsCamOn(track.enabled);
   };
 
-  // Copy invite link
-  const copyInviteLink = () => {
-    const inviteUrl = `${window.location.origin}?room=${roomId}`;
-    navigator.clipboard.writeText(inviteUrl);
+  const copyInviteLink = async () => {
+    await navigator.clipboard.writeText(`${window.location.origin}?room=${roomId}`);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2000);
   };
 
-  // Leave meeting
   const leaveMeeting = async (reason = '') => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
-    }
-
-    Object.keys(peerConnections.current).forEach((peerId) => {
-      closePeerConnection(peerId);
-    });
+    localStreamRef.current?.getTracks().forEach((track) => track.stop());
+    Object.keys(peerConnections.current).forEach((peerId) => closePeerConnection(peerId));
 
     if (roomId && currentUser) {
-      try {
-        await deleteDoc(doc(db, 'rooms', roomId, 'participants', currentUser.uid));
-      } catch (e) {
-        // Ignored on teardown
-      }
+      try { await deleteDoc(doc(db, 'rooms', roomId, 'participants', currentUser.uid)); } catch (_) {}
     }
 
-    setLocalStream(null);
     localStreamRef.current = null;
+    setLocalStream(null);
     setRemoteStreams({});
+    setConnectionStates({});
+    setParticipants({});
+    setPendingRequests([]);
     if (reason) setErrorMsg(reason);
     setAppState(reason ? 'ended' : 'home');
     window.history.pushState({}, '', window.location.pathname);
   };
 
-  // Host ends meeting for everyone
   const handleEndMeeting = async () => {
     if (!isHost || !roomId) return;
     try {
-      await updateDoc(doc(db, 'rooms', roomId), {
-        status: 'ended'
-      });
-      leaveMeeting();
+      await updateDoc(doc(db, 'rooms', roomId), { status: 'ended' });
     } catch (err) {
-      console.error('Error ending meeting:', err);
-      leaveMeeting();
+      console.error('End meeting failed:', err);
     }
+    await leaveMeeting();
   };
 
-  const totalTiles = 1 + Object.keys(remoteStreams).length;
+  const totalTiles = 1 + Object.keys(participants).filter((id) => id !== currentUser?.uid).length;
   const gridClass = totalTiles <= 1 ? 'grid-1' : totalTiles === 2 ? 'grid-2' : totalTiles === 3 ? 'grid-3' : 'grid-4';
 
   return (
     <div>
-      {/* 1. HOME SCREEN */}
       {appState === 'home' && (
         <div className="auth-wrapper">
           <div className="card">
             <h1 className="card-title">Minimal Video Meeting</h1>
             <p className="card-subtitle">Invite-only, serverless WebRTC video meetings</p>
-
-            {errorMsg && (
-              <div style={{ color: '#ef4444', fontSize: '0.85rem', marginBottom: '1rem', textAlign: 'center' }}>
-                {errorMsg}
-              </div>
-            )}
-
+            {errorMsg && <div style={{ color: '#ef4444', marginBottom: '1rem', textAlign: 'center' }}>{errorMsg}</div>}
             <form onSubmit={handleCreateMeeting}>
               <div className="form-group">
                 <label className="form-label">Your Name</label>
-                <input
-                  type="text"
-                  className="input-field"
-                  placeholder="e.g. Alice"
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  disabled={!authReady}
-                  required
-                />
+                <input className="input-field" placeholder="e.g. Alice" value={displayName} onChange={(e) => setDisplayName(e.target.value)} disabled={!authReady} required />
               </div>
-              <button type="submit" className="btn btn-primary" disabled={!authReady}>
-                {authReady ? 'Create Meeting' : 'Connecting...'}
-              </button>
+              <button type="submit" className="btn btn-primary" disabled={!authReady}>{authReady ? 'Create Meeting' : 'Connecting...'}</button>
             </form>
           </div>
         </div>
       )}
 
-      {/* 2. GUEST JOIN / REQUEST SCREEN */}
       {appState === 'requesting' && (
         <div className="auth-wrapper">
           <div className="card">
             <h1 className="card-title">Join Meeting</h1>
             <p className="card-subtitle">Room ID: <strong>{roomId}</strong></p>
-
-            {errorMsg && (
-              <div style={{ color: '#ef4444', fontSize: '0.85rem', marginBottom: '1rem', textAlign: 'center' }}>
-                {errorMsg}
-              </div>
-            )}
-
+            {errorMsg && <div style={{ color: '#ef4444', marginBottom: '1rem', textAlign: 'center' }}>{errorMsg}</div>}
             <form onSubmit={handleRequestJoin}>
               <div className="form-group">
                 <label className="form-label">Your Display Name</label>
-                <input
-                  type="text"
-                  className="input-field"
-                  placeholder="e.g. Bob"
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  disabled={!authReady}
-                  required
-                />
+                <input className="input-field" placeholder="e.g. Bob" value={displayName} onChange={(e) => setDisplayName(e.target.value)} disabled={!authReady} required />
               </div>
-              <button type="submit" className="btn btn-primary" disabled={!authReady}>
-                {authReady ? (isHost ? 'Enter Meeting (Host)' : 'Request to Join') : 'Connecting...'}
-              </button>
+              <button type="submit" className="btn btn-primary" disabled={!authReady}>{authReady ? (isHost ? 'Enter Meeting (Host)' : 'Request to Join') : 'Connecting...'}</button>
             </form>
           </div>
         </div>
       )}
 
-      {/* 3. WAITING FOR APPROVAL SCREEN */}
       {appState === 'waiting' && (
-        <div className="auth-wrapper">
-          <div className="card status-box">
-            <div className="spinner"></div>
-            <h2 className="card-title">Waiting for Host...</h2>
-            <p className="card-subtitle">The host will review your request shortly.</p>
-          </div>
-        </div>
+        <div className="auth-wrapper"><div className="card status-box"><div className="spinner" /><h2 className="card-title">Waiting for Host...</h2><p className="card-subtitle">The host will review your request shortly.</p></div></div>
       )}
 
-      {/* 4. REQUEST DENIED SCREEN */}
       {appState === 'denied' && (
-        <div className="auth-wrapper">
-          <div className="card status-box">
-            <AlertCircle size={48} color="#ef4444" style={{ margin: '0 auto 1rem auto' }} />
-            <h2 className="card-title">Request Declined</h2>
-            <p className="card-subtitle">The host did not admit you into this meeting.</p>
-            <button
-              onClick={() => {
-                setAppState('home');
-                window.history.pushState({}, '', window.location.pathname);
-              }}
-              className="btn btn-secondary"
-            >
-              Back to Home
-            </button>
-          </div>
-        </div>
+        <div className="auth-wrapper"><div className="card status-box"><AlertCircle size={48} color="#ef4444" style={{ margin: '0 auto 1rem' }} /><h2 className="card-title">Request Declined</h2><p className="card-subtitle">The host did not admit you into this meeting.</p><button onClick={() => { setAppState('home'); window.history.pushState({}, '', window.location.pathname); }} className="btn btn-secondary">Back to Home</button></div></div>
       )}
 
-      {/* 5. MEETING ENDED SCREEN */}
       {appState === 'ended' && (
-        <div className="auth-wrapper">
-          <div className="card status-box">
-            <h2 className="card-title">Meeting Ended</h2>
-            <p className="card-subtitle">{errorMsg || 'This video meeting has finished.'}</p>
-            <button
-              onClick={() => {
-                setErrorMsg('');
-                setAppState('home');
-              }}
-              className="btn btn-primary"
-            >
-              Return to Home
-            </button>
-          </div>
-        </div>
+        <div className="auth-wrapper"><div className="card status-box"><h2 className="card-title">Meeting Ended</h2><p className="card-subtitle">{errorMsg || 'This video meeting has finished.'}</p><button onClick={() => { setErrorMsg(''); setAppState('home'); }} className="btn btn-primary">Return to Home</button></div></div>
       )}
 
-      {/* 6. ACTIVE MEETING ROOM */}
       {appState === 'meeting' && (
         <div className="room-container">
           <header className="room-header">
             <div className="room-info">
-              <span className="room-badge">
-                <Users size={14} /> Room: {roomId}
-              </span>
-              {isHost && (
-                <span className="room-badge" style={{ borderColor: '#3b82f6', color: '#60a5fa' }}>
-                  <ShieldCheck size={14} /> Host
-                </span>
-              )}
+              <span className="room-badge"><Users size={14} /> Room: {roomId}</span>
+              {isHost && <span className="room-badge" style={{ borderColor: '#3b82f6', color: '#60a5fa' }}><ShieldCheck size={14} /> Host</span>}
             </div>
-
-            <button onClick={copyInviteLink} className="invite-btn">
-              {copiedLink ? <Check size={15} color="#4ade80" /> : <Copy size={15} />}
-              {copiedLink ? 'Copied Invite Link' : 'Copy Invite Link'}
-            </button>
+            <button onClick={copyInviteLink} className="invite-btn">{copiedLink ? <Check size={15} /> : <Copy size={15} />}{copiedLink ? 'Copied Invite Link' : 'Copy Invite Link'}</button>
           </header>
 
           <main className="video-grid-wrapper">
             <div className={`video-grid ${gridClass}`}>
-              {/* Local Participant Tile */}
-              <div className="video-card">
-                {isCamOn && localStream ? (
-                  <VideoTile stream={localStream} isLocal={true} />
-                ) : (
-                  <div className="avatar-placeholder">
-                    <div className="avatar-circle">
-                      {displayName ? displayName[0].toUpperCase() : 'U'}
-                    </div>
-                  </div>
-                )}
-                <div className="participant-badge">
-                  <span>{displayName} (You)</span>
-                  {!isMicOn && <MicOff size={13} color="#ef4444" />}
-                </div>
-              </div>
+              <ParticipantTile name={`${displayName} (You)`} stream={localStream} isLocal camOn={isCamOn} micOn={isMicOn} status="connected" />
 
-              {/* Remote Participants Tiles */}
-              {Object.entries(remoteStreams).map(([peerId, data]) => {
-                const peerInfo = participants[peerId] || {};
-                return (
-                  <div key={peerId} className="video-card">
-                    {data.stream ? (
-                      <VideoTile stream={data.stream} isLocal={false} />
-                    ) : (
-                      <div className="avatar-placeholder">
-                        <div className="avatar-circle">
-                          {peerInfo.displayName ? peerInfo.displayName[0].toUpperCase() : 'P'}
-                        </div>
-                      </div>
-                    )}
-                    <div className="participant-badge">
-                      <span>{peerInfo.displayName || 'Participant'}</span>
-                      {peerInfo.isHost && (
-                        <span style={{ color: '#60a5fa', marginLeft: '4px', fontSize: '0.75rem' }}>(Host)</span>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
+              {Object.entries(participants)
+                .filter(([peerId]) => peerId !== currentUser?.uid)
+                .map(([peerId, peerInfo]) => (
+                  <ParticipantTile
+                    key={peerId}
+                    name={`${peerInfo.displayName || 'Participant'}${peerInfo.isHost ? ' (Host)' : ''}`}
+                    stream={remoteStreams[peerId]?.stream || null}
+                    camOn={Boolean(remoteStreams[peerId]?.stream)}
+                    micOn
+                    status={connectionStates[peerId] || 'waiting'}
+                  />
+                ))}
             </div>
 
-            {/* Host Floating Pending Requests Panel */}
             {isHost && pendingRequests.length > 0 && (
               <div className="requests-panel">
-                <div className="requests-title">
-                  <Users size={16} /> Pending Requests ({pendingRequests.length})
-                </div>
+                <div className="requests-title"><Users size={16} /> Pending Requests ({pendingRequests.length})</div>
                 {pendingRequests.map((req) => (
                   <div key={req.id} className="request-item">
                     <span className="request-name">{req.displayName}</span>
                     <div className="request-actions">
-                      <button
-                        onClick={() => handleAllowGuest(req.id)}
-                        className="btn-xs btn-success"
-                        title="Allow"
-                      >
-                        <UserCheck size={14} /> Allow
-                      </button>
-                      <button
-                        onClick={() => handleDenyGuest(req.id)}
-                        className="btn-xs btn-danger"
-                        title="Deny"
-                      >
-                        <UserX size={14} /> Deny
-                      </button>
+                      <button onClick={() => handleAllowGuest(req.id)} className="btn-xs btn-success"><UserCheck size={14} /> Allow</button>
+                      <button onClick={() => handleDenyGuest(req.id)} className="btn-xs btn-danger"><UserX size={14} /> Deny</button>
                     </div>
                   </div>
                 ))}
@@ -699,39 +562,10 @@ export default function App() {
           </main>
 
           <footer className="room-controls">
-            <button
-              onClick={toggleMic}
-              className={`btn btn-icon ${isMicOn ? 'btn-secondary' : 'active-off'}`}
-              title={isMicOn ? 'Mute Mic' : 'Unmute Mic'}
-            >
-              {isMicOn ? <Mic size={20} /> : <MicOff size={20} />}
-            </button>
-
-            <button
-              onClick={toggleCam}
-              className={`btn btn-icon ${isCamOn ? 'btn-secondary' : 'active-off'}`}
-              title={isCamOn ? 'Turn Off Camera' : 'Turn On Camera'}
-            >
-              {isCamOn ? <VideoIcon size={20} /> : <VideoOff size={20} />}
-            </button>
-
-            <button
-              onClick={() => leaveMeeting()}
-              className="btn btn-icon btn-danger"
-              title="Leave Call"
-            >
-              <PhoneOff size={20} />
-            </button>
-
-            {isHost && (
-              <button
-                onClick={handleEndMeeting}
-                className="btn btn-danger"
-                style={{ width: 'auto', padding: '0.65rem 1.25rem' }}
-              >
-                End Meeting
-              </button>
-            )}
+            <button onClick={toggleMic} className={`btn btn-icon ${isMicOn ? 'btn-secondary' : 'active-off'}`} title={isMicOn ? 'Mute Mic' : 'Unmute Mic'}>{isMicOn ? <Mic size={20} /> : <MicOff size={20} />}</button>
+            <button onClick={toggleCam} className={`btn btn-icon ${isCamOn ? 'btn-secondary' : 'active-off'}`} title={isCamOn ? 'Turn Off Camera' : 'Turn On Camera'}>{isCamOn ? <VideoIcon size={20} /> : <VideoOff size={20} />}</button>
+            <button onClick={() => leaveMeeting()} className="btn btn-icon btn-danger" title="Leave Call"><PhoneOff size={20} /></button>
+            {isHost && <button onClick={handleEndMeeting} className="btn btn-danger" style={{ width: 'auto', padding: '0.65rem 1.25rem' }}>End Meeting</button>}
           </footer>
         </div>
       )}
@@ -739,22 +573,40 @@ export default function App() {
   );
 }
 
-function VideoTile({ stream, isLocal }) {
+function ParticipantTile({ name, stream, isLocal = false, camOn = true, micOn = true, status = 'waiting' }) {
   const videoRef = useRef(null);
 
   useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
-    }
+    const video = videoRef.current;
+    if (!video || !stream) return;
+    video.srcObject = stream;
+    const play = () => video.play().catch(() => {});
+    if (video.readyState >= 2) play();
+    else video.onloadedmetadata = play;
+    return () => { video.onloadedmetadata = null; };
   }, [stream]);
 
+  const initial = name?.replace(' (You)', '').charAt(0).toUpperCase() || 'P';
+  const showVideo = Boolean(stream) && camOn;
+
   return (
-    <video
-      ref={videoRef}
-      autoPlay
-      playsInline
-      muted={isLocal}
-      className={`video-element ${isLocal ? 'video-mirror' : ''}`}
-    />
+    <div className="video-card" style={{ position: 'relative' }}>
+      {showVideo ? (
+        <video ref={videoRef} autoPlay playsInline muted={isLocal} className={`video-element ${isLocal ? 'video-mirror' : ''}`} />
+      ) : (
+        <div className="avatar-placeholder">
+          <div className="avatar-circle">{initial}</div>
+        </div>
+      )}
+      <div className="participant-badge">
+        <span>{name}</span>
+        {!micOn && <MicOff size={13} color="#ef4444" />}
+      </div>
+      {!isLocal && !stream && (
+        <div style={{ position: 'absolute', top: 10, left: 10, background: 'rgba(0,0,0,.6)', borderRadius: 8, padding: '4px 8px', fontSize: 12 }}>
+          {status === 'failed' ? 'Connection failed' : status === 'connected' ? 'Camera off' : 'Connecting…'}
+        </div>
+      )}
+    </div>
   );
 }
