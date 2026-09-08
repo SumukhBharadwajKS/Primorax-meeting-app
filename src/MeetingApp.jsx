@@ -1,8 +1,45 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { collection, deleteDoc, doc, getDoc, onSnapshot, query, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
 import { db, initAuth } from './firebase';
 import { ICE_SERVERS, generateRoomId } from './webrtc';
-import { AlertCircle, Check, Copy, Mic, MicOff, PhoneOff, ShieldCheck, UserCheck, UserX, Users, Video as VideoIcon, VideoOff } from 'lucide-react';
+import {
+  ArrowRight,
+  Check,
+  Copy,
+  Link2,
+  Loader2,
+  Mic,
+  MicOff,
+  MonitorUp,
+  PhoneOff,
+  Shield,
+  Sparkles,
+  UserCheck,
+  UserRound,
+  UserX,
+  Users,
+  Video,
+  VideoOff,
+  Wifi,
+  X,
+} from 'lucide-react';
+
+const SIGNAL_TYPES = new Set(['offer', 'answer', 'candidate']);
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export default function MeetingApp() {
   const [user, setUser] = useState(null);
@@ -10,7 +47,7 @@ export default function MeetingApp() {
   const [roomId, setRoomId] = useState('');
   const [name, setName] = useState('');
   const [host, setHost] = useState(false);
-  const [state, setState] = useState('home');
+  const [screen, setScreen] = useState('home');
   const [localStream, setLocalStream] = useState(null);
   const [remoteStreams, setRemoteStreams] = useState({});
   const [participants, setParticipants] = useState({});
@@ -20,83 +57,103 @@ export default function MeetingApp() {
   const [cam, setCam] = useState(true);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
 
   const userRef = useRef(null);
   const roomRef = useRef('');
   const streamRef = useRef(null);
-  const pcs = useRef({});
-  const meta = useRef({});
-  const candidates = useRef({});
-  const requestUnsub = useRef(null);
+  const peersRef = useRef({});
+  const metaRef = useRef({});
+  const candidateQueueRef = useRef({});
+  const requestUnsubRef = useRef(null);
 
   useEffect(() => { userRef.current = user; }, [user]);
   useEffect(() => { roomRef.current = roomId; }, [roomId]);
 
   useEffect(() => {
+    let alive = true;
     initAuth().then(async (u) => {
+      if (!alive) return;
       userRef.current = u;
       setUser(u);
       setReady(true);
-      const r = new URLSearchParams(window.location.search).get('room');
-      if (!r) return;
-      const id = r.toLowerCase().trim();
+      const id = new URLSearchParams(window.location.search).get('room')?.trim().toLowerCase();
+      if (!id) return;
       roomRef.current = id;
       setRoomId(id);
       try {
         const snap = await getDoc(doc(db, 'rooms', id));
         if (snap.exists() && snap.data().hostUid === u.uid) setHost(true);
-      } catch (e) { console.error(e); }
-      setState('requesting');
+      } catch (_) {
+        // Guests are intentionally unable to read a room until they create a join request.
+      }
+      setScreen('join');
     }).catch((e) => {
       console.error(e);
-      setError('Authentication failed. Check Firebase Anonymous Auth.');
+      setError('Could not connect to the meeting service.');
     });
+    return () => { alive = false; };
   }, []);
 
-  const setStatus = (id, value) => setPeerStatus((p) => ({ ...p, [id]: value }));
+  const setStatus = (id, value) => {
+    setPeerStatus((current) => ({ ...current, [id]: value }));
+  };
 
   const sendSignal = async (to, type, payload = {}) => {
-    const r = roomRef.current;
-    const u = userRef.current;
-    if (!r || !u) return;
-    await setDoc(doc(collection(db, 'rooms', r, 'signals')), {
-      from: u.uid, to, type, ...payload, createdAt: serverTimestamp()
+    const room = roomRef.current;
+    const current = userRef.current;
+    if (!room || !current || !SIGNAL_TYPES.has(type)) return;
+    await setDoc(doc(collection(db, 'rooms', room, 'signals')), {
+      from: current.uid,
+      to,
+      type,
+      ...payload,
+      createdAt: serverTimestamp(),
     });
   };
 
-  const closePeer = (id, removeVideo = true) => {
-    const pc = pcs.current[id];
+  const closePeer = (peerId, removeVideo = true) => {
+    const pc = peersRef.current[peerId];
     if (pc) {
       pc.ontrack = null;
       pc.onicecandidate = null;
       pc.onnegotiationneeded = null;
       pc.onconnectionstatechange = null;
       pc.oniceconnectionstatechange = null;
-      pc.close();
-      delete pcs.current[id];
+      try { pc.close(); } catch (_) {}
+      delete peersRef.current[peerId];
     }
-    delete meta.current[id];
-    delete candidates.current[id];
-    if (removeVideo) setRemoteStreams((p) => { const n = { ...p }; delete n[id]; return n; });
-    setPeerStatus((p) => { const n = { ...p }; delete n[id]; return n; });
+    delete metaRef.current[peerId];
+    delete candidateQueueRef.current[peerId];
+    if (removeVideo) {
+      setRemoteStreams((current) => {
+        const next = { ...current };
+        delete next[peerId];
+        return next;
+      });
+    }
+    setPeerStatus((current) => {
+      const next = { ...current };
+      delete next[peerId];
+      return next;
+    });
   };
 
   const createPeer = (peerId) => {
-    if (pcs.current[peerId]) return pcs.current[peerId];
-    const u = userRef.current;
-    const r = roomRef.current;
+    if (peersRef.current[peerId]) return peersRef.current[peerId];
+    const current = userRef.current;
     const stream = streamRef.current;
-    if (!u || !r || !stream) return null;
+    if (!current || !stream) return null;
 
     const pc = new RTCPeerConnection(ICE_SERVERS);
-    pcs.current[peerId] = pc;
-    candidates.current[peerId] = [];
-    meta.current[peerId] = {
-      polite: u.uid < peerId,
+    peersRef.current[peerId] = pc;
+    candidateQueueRef.current[peerId] = [];
+    metaRef.current[peerId] = {
+      polite: current.uid < peerId,
       makingOffer: false,
       ignoreOffer: false,
       settingRemoteAnswer: false,
-      restarting: false
+      restartTimer: null,
     };
     setStatus(peerId, 'connecting');
 
@@ -105,47 +162,51 @@ export default function MeetingApp() {
     pc.ontrack = (event) => {
       const incoming = event.streams?.[0];
       if (!incoming) return;
-      setRemoteStreams((p) => ({ ...p, [peerId]: incoming }));
+      setRemoteStreams((currentStreams) => ({ ...currentStreams, [peerId]: incoming }));
       setStatus(peerId, 'connected');
     };
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) sendSignal(peerId, 'candidate', { candidate: event.candidate.toJSON() }).catch(console.error);
+      if (event.candidate) {
+        sendSignal(peerId, 'candidate', { candidate: event.candidate.toJSON() }).catch(console.error);
+      }
     };
 
     pc.onnegotiationneeded = async () => {
-      const m = meta.current[peerId];
-      if (!m || pcs.current[peerId] !== pc) return;
+      const meta = metaRef.current[peerId];
+      if (!meta || peersRef.current[peerId] !== pc) return;
       try {
-        m.makingOffer = true;
+        meta.makingOffer = true;
         await pc.setLocalDescription();
         await sendSignal(peerId, pc.localDescription.type, { sdp: pc.localDescription.sdp });
       } catch (e) {
-        console.error('Negotiation failed:', e);
+        console.error('WebRTC negotiation error', e);
       } finally {
-        m.makingOffer = false;
+        meta.makingOffer = false;
       }
     };
 
     pc.onconnectionstatechange = () => {
-      const s = pc.connectionState;
-      console.log('[WebRTC]', u.uid, peerId, 'connection', s);
-      if (s === 'connected') setStatus(peerId, 'connected');
-      else if (s === 'disconnected') setStatus(peerId, 'disconnected');
-      else if (s === 'failed') setStatus(peerId, 'failed');
+      const state = pc.connectionState;
+      if (state === 'connected') setStatus(peerId, 'connected');
+      else if (state === 'disconnected') setStatus(peerId, 'disconnected');
+      else if (state === 'failed') setStatus(peerId, 'failed');
     };
 
     pc.oniceconnectionstatechange = () => {
-      const s = pc.iceConnectionState;
-      console.log('[WebRTC]', u.uid, peerId, 'ICE', s);
-      if (s === 'connected' || s === 'completed') setStatus(peerId, 'connected');
-      if (s === 'failed') {
+      const state = pc.iceConnectionState;
+      if (state === 'connected' || state === 'completed') setStatus(peerId, 'connected');
+      if (state === 'failed') {
         setStatus(peerId, 'failed');
-        const m = meta.current[peerId];
-        if (m && !m.restarting) {
-          m.restarting = true;
-          try { pc.restartIce(); } catch (_) {}
-          setTimeout(() => { if (meta.current[peerId]) meta.current[peerId].restarting = false; }, 5000);
+        const meta = metaRef.current[peerId];
+        if (meta && !meta.restartTimer) {
+          meta.restartTimer = window.setTimeout(() => {
+            meta.restartTimer = null;
+            const live = peersRef.current[peerId];
+            if (live && live.signalingState === 'stable') {
+              try { live.restartIce(); } catch (_) {}
+            }
+          }, 800);
         }
       }
     };
@@ -153,50 +214,73 @@ export default function MeetingApp() {
     return pc;
   };
 
+  const startMedia = async () => {
+    if (streamRef.current) return streamRef.current;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Camera and microphone are not available in this browser.');
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    streamRef.current = stream;
+    setLocalStream(stream);
+    setMic(stream.getAudioTracks()[0]?.enabled ?? true);
+    setCam(stream.getVideoTracks()[0]?.enabled ?? true);
+    return stream;
+  };
+
   const startMeeting = async (id, displayName, isHost) => {
+    setBusy(true);
+    setError('');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: true
-      });
-      streamRef.current = stream;
-      setLocalStream(stream);
-      setMic(stream.getAudioTracks()[0]?.enabled ?? true);
-      setCam(stream.getVideoTracks()[0]?.enabled ?? true);
+      await startMedia();
       await setDoc(doc(db, 'rooms', id, 'participants', userRef.current.uid), {
         participantId: userRef.current.uid,
         displayName,
         isHost,
-        joinedAt: serverTimestamp()
+        joinedAt: serverTimestamp(),
       });
-      setState('meeting');
+      setScreen('meeting');
     } catch (e) {
       console.error(e);
-      setError(e?.name === 'NotAllowedError' ? 'Please allow camera and microphone access.' : 'Could not access camera and microphone.');
+      const message = e?.name === 'NotAllowedError'
+        ? 'Camera/microphone permission was blocked. Allow access and try again.'
+        : e?.message || 'Could not start your camera and microphone.';
+      setError(message);
+    } finally {
+      setBusy(false);
     }
   };
 
-  const createMeeting = async (e) => {
-    e.preventDefault();
-    if (!name.trim() || !userRef.current) return;
+  const createMeeting = async (event) => {
+    event.preventDefault();
+    if (!ready || !userRef.current || !name.trim()) return;
+    setBusy(true);
     setError('');
     try {
       const id = generateRoomId();
-      await setDoc(doc(db, 'rooms', id), { status: 'active', hostUid: userRef.current.uid, createdAt: serverTimestamp() });
+      await setDoc(doc(db, 'rooms', id), {
+        status: 'active',
+        hostUid: userRef.current.uid,
+        createdAt: serverTimestamp(),
+      });
       roomRef.current = id;
       setRoomId(id);
       setHost(true);
-      window.history.pushState({}, '', `?room=${id}`);
+      window.history.replaceState({}, '', `?room=${id}`);
       await startMeeting(id, name.trim(), true);
     } catch (e) {
       console.error(e);
-      setError('Failed to create meeting.');
+      setError('Could not create the meeting. Check Firebase and try again.');
+      setBusy(false);
     }
   };
 
-  const requestJoin = async (e) => {
-    e.preventDefault();
-    if (!name.trim() || !roomRef.current || !userRef.current) return;
+  const requestJoin = async (event) => {
+    event.preventDefault();
+    if (!ready || !userRef.current || !roomRef.current || !name.trim()) return;
+    setBusy(true);
     setError('');
     if (host) {
       await startMeeting(roomRef.current, name.trim(), true);
@@ -204,120 +288,156 @@ export default function MeetingApp() {
     }
     try {
       const requestRef = doc(db, 'rooms', roomRef.current, 'requests', userRef.current.uid);
-      await setDoc(requestRef, { displayName: name.trim(), status: 'pending', createdAt: serverTimestamp() });
-      setState('waiting');
-      if (requestUnsub.current) requestUnsub.current();
-      requestUnsub.current = onSnapshot(requestRef, async (snap) => {
+      await setDoc(requestRef, {
+        displayName: name.trim(),
+        status: 'pending',
+        createdAt: serverTimestamp(),
+      });
+      setScreen('waiting');
+      requestUnsubRef.current?.();
+      requestUnsubRef.current = onSnapshot(requestRef, async (snap) => {
         if (!snap.exists()) return;
-        const s = snap.data().status;
-        if (s === 'approved') {
-          requestUnsub.current?.();
-          requestUnsub.current = null;
+        const status = snap.data().status;
+        if (status === 'approved') {
+          requestUnsubRef.current?.();
+          requestUnsubRef.current = null;
           await startMeeting(roomRef.current, name.trim(), false);
-        } else if (s === 'denied') {
-          requestUnsub.current?.();
-          requestUnsub.current = null;
-          setState('denied');
+        }
+        if (status === 'denied') {
+          requestUnsubRef.current?.();
+          requestUnsubRef.current = null;
+          setBusy(false);
+          setScreen('denied');
         }
       });
     } catch (e) {
       console.error(e);
-      setError('Meeting does not exist, has ended, or access was blocked.');
+      setError('That meeting is unavailable or the invite is invalid.');
+      setBusy(false);
     }
   };
 
   useEffect(() => {
-    if (state !== 'meeting' || !roomId || !user) return;
+    if (screen !== 'meeting' || !roomId || !user) return undefined;
 
     const roomUnsub = onSnapshot(doc(db, 'rooms', roomId), (snap) => {
-      if (snap.exists() && snap.data().status === 'ended') leaveMeeting('Meeting ended by host.');
+      if (snap.exists() && snap.data().status === 'ended') {
+        leaveMeeting('The host ended the meeting.', false);
+      }
     });
-
-    let reqUnsub = () => {};
-    if (host) {
-      reqUnsub = onSnapshot(query(collection(db, 'rooms', roomId, 'requests'), where('status', '==', 'pending')), (snap) => {
-        setPending(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      });
-    }
 
     const participantsUnsub = onSnapshot(collection(db, 'rooms', roomId, 'participants'), (snap) => {
       const next = {};
-      snap.forEach((d) => { next[d.id] = d.data(); });
+      snap.forEach((item) => { next[item.id] = item.data(); });
       setParticipants(next);
+
       Object.keys(next).forEach((id) => {
-        if (id !== user.uid && !pcs.current[id]) createPeer(id);
+        if (id !== user.uid && !peersRef.current[id]) createPeer(id);
       });
-      Object.keys(pcs.current).forEach((id) => {
+      Object.keys(peersRef.current).forEach((id) => {
         if (!next[id]) closePeer(id);
       });
     });
 
-    const signalsUnsub = onSnapshot(query(collection(db, 'rooms', roomId, 'signals'), where('to', '==', user.uid)), async (snap) => {
-      for (const change of snap.docChanges()) {
-        if (change.type !== 'added') continue;
-        const ref = change.doc.ref;
-        const signal = change.doc.data();
-        const peerId = signal.from;
-        try {
-          const pc = pcs.current[peerId] || createPeer(peerId);
-          if (!pc) continue;
-          const m = meta.current[peerId];
+    const signalsUnsub = onSnapshot(
+      query(collection(db, 'rooms', roomId, 'signals'), where('to', '==', user.uid)),
+      async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'added') continue;
+          const signalRef = change.doc.ref;
+          const signal = change.doc.data();
+          if (!SIGNAL_TYPES.has(signal.type)) continue;
+          const peerId = signal.from;
+          try {
+            const pc = peersRef.current[peerId] || createPeer(peerId);
+            if (!pc) continue;
+            const meta = metaRef.current[peerId];
 
-          if (signal.type === 'offer' || signal.type === 'answer') {
-            const description = { type: signal.type, sdp: signal.sdp };
-            const readyForOffer = !m.makingOffer && (pc.signalingState === 'stable' || m.settingRemoteAnswer);
-            const collision = signal.type === 'offer' && !readyForOffer;
-            m.ignoreOffer = !m.polite && collision;
-            if (m.ignoreOffer) {
-              await deleteDoc(ref);
-              continue;
+            if (signal.type === 'offer' || signal.type === 'answer') {
+              const description = { type: signal.type, sdp: signal.sdp };
+              const readyForOffer = !meta.makingOffer &&
+                (pc.signalingState === 'stable' || meta.settingRemoteAnswer);
+              const collision = signal.type === 'offer' && !readyForOffer;
+              meta.ignoreOffer = !meta.polite && collision;
+
+              if (meta.ignoreOffer) {
+                await deleteDoc(signalRef);
+                continue;
+              }
+
+              if (signal.type === 'answer') meta.settingRemoteAnswer = true;
+              if (collision && meta.polite) {
+                await pc.setLocalDescription({ type: 'rollback' });
+              }
+
+              await pc.setRemoteDescription(description);
+              meta.settingRemoteAnswer = false;
+
+              const queue = candidateQueueRef.current[peerId] || [];
+              for (const candidate of queue) await pc.addIceCandidate(candidate);
+              candidateQueueRef.current[peerId] = [];
+
+              if (signal.type === 'offer') {
+                await pc.setLocalDescription();
+                await sendSignal(peerId, 'answer', { sdp: pc.localDescription.sdp });
+              }
+            } else if (signal.type === 'candidate') {
+              if (meta.ignoreOffer) {
+                await deleteDoc(signalRef);
+                continue;
+              }
+              const candidate = new RTCIceCandidate(signal.candidate);
+              if (pc.remoteDescription) await pc.addIceCandidate(candidate);
+              else {
+                candidateQueueRef.current[peerId] ||= [];
+                candidateQueueRef.current[peerId].push(candidate);
+              }
             }
-            if (signal.type === 'answer') m.settingRemoteAnswer = true;
-            if (collision && m.polite) await pc.setLocalDescription({ type: 'rollback' });
-            await pc.setRemoteDescription(description);
-            m.settingRemoteAnswer = false;
-            const queued = candidates.current[peerId] || [];
-            for (const c of queued) await pc.addIceCandidate(c);
-            candidates.current[peerId] = [];
-            if (signal.type === 'offer') {
-              await pc.setLocalDescription();
-              await sendSignal(peerId, pc.localDescription.type, { sdp: pc.localDescription.sdp });
-            }
-          } else if (signal.type === 'candidate') {
-            const candidate = new RTCIceCandidate(signal.candidate);
-            if (m.ignoreOffer) {
-              // Ignore candidates belonging to an offer collision we rejected.
-            } else if (pc.remoteDescription) {
-              await pc.addIceCandidate(candidate);
-            } else {
-              candidates.current[peerId] ||= [];
-              candidates.current[peerId].push(candidate);
-            }
+
+            await deleteDoc(signalRef);
+          } catch (e) {
+            console.error('Signal processing failed', e);
+            // Keep the message if it failed so a transient listener/state issue does not destroy signaling.
           }
-          await deleteDoc(ref);
-        } catch (e) {
-          console.error('Signal error:', e);
-          try { await deleteDoc(ref); } catch (_) {}
         }
-      }
-    });
+      },
+    );
+
+    let requestUnsub = () => {};
+    if (host) {
+      requestUnsub = onSnapshot(
+        query(collection(db, 'rooms', roomId, 'requests'), where('status', '==', 'pending')),
+        (snap) => setPending(snap.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      );
+    }
 
     return () => {
       roomUnsub();
-      reqUnsub();
       participantsUnsub();
       signalsUnsub();
+      requestUnsub();
     };
-  }, [state, roomId, user, host]);
+  }, [screen, roomId, user, host]);
 
-  const allow = async (id) => { try { await updateDoc(doc(db, 'rooms', roomId, 'requests', id), { status: 'approved' }); } catch (e) { console.error(e); } };
-  const deny = async (id) => { try { await updateDoc(doc(db, 'rooms', roomId, 'requests', id), { status: 'denied' }); } catch (e) { console.error(e); } };
+  const allow = async (id) => {
+    try {
+      await updateDoc(doc(db, 'rooms', roomId, 'requests', id), { status: 'approved' });
+      setPending((current) => current.filter((item) => item.id !== id));
+    } catch (e) { console.error(e); }
+  };
 
-  const leaveMeeting = async (reason = '') => {
-    requestUnsub.current?.();
-    requestUnsub.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    Object.keys(pcs.current).forEach((id) => closePeer(id));
+  const deny = async (id) => {
+    try {
+      await updateDoc(doc(db, 'rooms', roomId, 'requests', id), { status: 'denied' });
+      setPending((current) => current.filter((item) => item.id !== id));
+    } catch (e) { console.error(e); }
+  };
+
+  const leaveMeeting = async (reason = '', returnHome = true) => {
+    requestUnsubRef.current?.();
+    requestUnsubRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    Object.keys(peersRef.current).forEach((id) => closePeer(id));
     if (roomRef.current && userRef.current) {
       try { await deleteDoc(doc(db, 'rooms', roomRef.current, 'participants', userRef.current.uid)); } catch (_) {}
     }
@@ -327,9 +447,12 @@ export default function MeetingApp() {
     setParticipants({});
     setPeerStatus({});
     setPending([]);
+    setBusy(false);
     if (reason) setError(reason);
-    setState(reason ? 'ended' : 'home');
-    window.history.pushState({}, '', window.location.pathname);
+    if (returnHome) {
+      setScreen(reason ? 'ended' : 'home');
+      window.history.replaceState({}, '', window.location.pathname);
+    }
   };
 
   const endMeeting = async () => {
@@ -338,72 +461,214 @@ export default function MeetingApp() {
   };
 
   const toggleMic = () => {
-    const t = streamRef.current?.getAudioTracks()[0];
-    if (!t) return;
-    t.enabled = !t.enabled;
-    setMic(t.enabled);
+    const track = streamRef.current?.getAudioTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    setMic(track.enabled);
   };
+
   const toggleCam = () => {
-    const t = streamRef.current?.getVideoTracks()[0];
-    if (!t) return;
-    t.enabled = !t.enabled;
-    setCam(t.enabled);
-  };
-  const copyLink = async () => {
-    await navigator.clipboard.writeText(`${window.location.origin}?room=${roomId}`);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    setCam(track.enabled);
   };
 
-  const ids = Object.keys(participants).filter((id) => id !== user?.uid);
-  const total = 1 + ids.length;
-  const grid = total <= 1 ? 'grid-1' : total === 2 ? 'grid-2' : 'grid-4';
+  const copyInvite = async () => {
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}?room=${roomId}`);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch (_) {
+      setError('Could not copy the invite link.');
+    }
+  };
 
-  return <div>
-    {state === 'home' && <div className="auth-wrapper"><div className="card">
-      <h1 className="card-title">Minimal Video Meeting</h1>
-      <p className="card-subtitle">Invite-only video meetings</p>
-      {error && <div style={{ color: '#ef4444', marginBottom: '1rem', textAlign: 'center' }}>{error}</div>}
-      <form onSubmit={createMeeting}><div className="form-group"><label className="form-label">Your Name</label><input className="input-field" placeholder="e.g. Alice" value={name} onChange={(e) => setName(e.target.value)} disabled={!ready} required /></div><button className="btn btn-primary" disabled={!ready}>{ready ? 'Create Meeting' : 'Connecting...'}</button></form>
-    </div></div>}
+  const remoteIds = Object.keys(participants).filter((id) => id !== user?.uid);
+  const tileCount = Math.max(1, remoteIds.length + 1);
 
-    {state === 'requesting' && <div className="auth-wrapper"><div className="card">
-      <h1 className="card-title">Join Meeting</h1><p className="card-subtitle">Room ID: <strong>{roomId}</strong></p>
-      {error && <div style={{ color: '#ef4444', marginBottom: '1rem', textAlign: 'center' }}>{error}</div>}
-      <form onSubmit={requestJoin}><div className="form-group"><label className="form-label">Your Display Name</label><input className="input-field" placeholder="e.g. Bob" value={name} onChange={(e) => setName(e.target.value)} disabled={!ready} required /></div><button className="btn btn-primary" disabled={!ready}>{ready ? (host ? 'Enter Meeting (Host)' : 'Request to Join') : 'Connecting...'}</button></form>
-    </div></div>}
+  if (screen === 'meeting') {
+    return (
+      <MeetingRoom
+        name={name}
+        host={host}
+        roomId={roomId}
+        localStream={localStream}
+        remoteStreams={remoteStreams}
+        participants={participants}
+        peerStatus={peerStatus}
+        remoteIds={remoteIds}
+        tileCount={tileCount}
+        mic={mic}
+        cam={cam}
+        pending={pending}
+        copied={copied}
+        onCopy={copyInvite}
+        onToggleMic={toggleMic}
+        onToggleCam={toggleCam}
+        onLeave={() => leaveMeeting()}
+        onEnd={endMeeting}
+        onAllow={allow}
+        onDeny={deny}
+      />
+    );
+  }
 
-    {state === 'waiting' && <div className="auth-wrapper"><div className="card status-box"><div className="spinner"/><h2 className="card-title">Waiting for Host...</h2><p className="card-subtitle">The host will review your request shortly.</p></div></div>}
-    {state === 'denied' && <div className="auth-wrapper"><div className="card status-box"><AlertCircle size={48} color="#ef4444"/><h2 className="card-title">Request Declined</h2><p className="card-subtitle">The host did not admit you.</p><button className="btn btn-secondary" onClick={() => { setState('home'); window.history.pushState({}, '', window.location.pathname); }}>Back to Home</button></div></div>}
-    {state === 'ended' && <div className="auth-wrapper"><div className="card status-box"><h2 className="card-title">Meeting Ended</h2><p className="card-subtitle">{error || 'This meeting has finished.'}</p><button className="btn btn-primary" onClick={() => { setError(''); setState('home'); }}>Return to Home</button></div></div>}
+  return (
+    <div className="app-shell">
+      <div className="ambient ambient-one" />
+      <div className="ambient ambient-two" />
+      <header className="landing-nav">
+        <div className="brand"><span className="brand-mark"><Video size={18} /></span><span>Primora<span className="brand-accent">X</span></span></div>
+        <div className="nav-pill"><span className="live-dot" /> Private meetings</div>
+      </header>
 
-    {state === 'meeting' && <div className="room-container">
-      <header className="room-header"><div className="room-info"><span className="room-badge"><Users size={14}/> Room: {roomId}</span>{host && <span className="room-badge" style={{ borderColor: '#3b82f6', color: '#60a5fa' }}><ShieldCheck size={14}/> Host</span>}</div><button className="invite-btn" onClick={copyLink}>{copied ? <Check size={15}/> : <Copy size={15}/>} {copied ? 'Copied' : 'Copy Invite Link'}</button></header>
-      <main className="video-grid-wrapper"><div className={`video-grid ${grid}`}>
-        <Tile name={`${name} (You)`} stream={localStream} local cam={cam} mic={mic} status="connected"/>
-        {ids.map((id) => <Tile key={id} name={`${participants[id]?.displayName || 'Participant'}${participants[id]?.isHost ? ' (Host)' : ''}`} stream={remoteStreams[id] || null} local={false} cam={Boolean(remoteStreams[id])} mic status={peerStatus[id] || 'connecting'}/>) }
-      </div>
-      {host && pending.length > 0 && <div className="requests-panel"><div className="requests-title"><Users size={16}/> Pending Requests ({pending.length})</div>{pending.map((r) => <div className="request-item" key={r.id}><span className="request-name">{r.displayName}</span><div className="request-actions"><button className="btn-xs btn-success" onClick={() => allow(r.id)}><UserCheck size={14}/> Allow</button><button className="btn-xs btn-danger" onClick={() => deny(r.id)}><UserX size={14}/> Deny</button></div></div>)}</div>}
+      <main className="landing-main">
+        {screen === 'home' && (
+          <section className="hero-layout">
+            <div className="hero-copy">
+              <div className="eyebrow"><Sparkles size={15} /> Simple video meetings, without the clutter</div>
+              <h1>Meet face to face.<br /><span>Just send a link.</span></h1>
+              <p className="hero-text">Create a private room, invite your people, and start talking. No account, no downloads, no noise.</p>
+              <div className="trust-row"><span><Shield size={15} /> Invite-only</span><span><Wifi size={15} /> Peer-to-peer</span><span><Users size={15} /> Up to 4 people</span></div>
+            </div>
+            <div className="entry-card">
+              <div className="card-glow" />
+              <div className="entry-icon"><Video size={23} /></div>
+              <h2>Start a meeting</h2>
+              <p>Create a room and share the invite with your team.</p>
+              {error && <ErrorBox text={error} />}
+              <form onSubmit={createMeeting}>
+                <label>Your name</label>
+                <div className="field-wrap"><UserRound size={18} /><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Sumukh" autoComplete="name" disabled={!ready || busy} required /></div>
+                <button className="primary-button" disabled={!ready || busy}>{busy ? <><Loader2 className="spin" size={18} /> Starting...</> : <>Create meeting <ArrowRight size={18} /></>}</button>
+              </form>
+              <div className="card-note">You'll be the host and can approve who joins.</div>
+            </div>
+          </section>
+        )}
+
+        {screen === 'join' && (
+          <section className="center-layout">
+            <div className="entry-card join-card">
+              <div className="join-top"><span className="small-kicker">INVITATION</span><span className="room-code">{roomId}</span></div>
+              <div className="entry-icon"><Link2 size={23} /></div>
+              <h2>Join the meeting</h2>
+              <p>Enter the name you'd like other participants to see.</p>
+              {error && <ErrorBox text={error} />}
+              <form onSubmit={requestJoin}>
+                <label>Your name</label>
+                <div className="field-wrap"><UserRound size={18} /><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Alex" disabled={!ready || busy} required /></div>
+                <button className="primary-button" disabled={!ready || busy}>{busy ? <><Loader2 className="spin" size={18} /> Connecting...</> : host ? <>Enter as host <ArrowRight size={18} /></> : <>Request to join <ArrowRight size={18} /></>}</button>
+              </form>
+              <button className="text-button" onClick={() => { setScreen('home'); setError(''); window.history.replaceState({}, '', window.location.pathname); }}>← Back</button>
+            </div>
+          </section>
+        )}
+
+        {screen === 'waiting' && <StatusCard icon={<Loader2 className="spin" size={25} />} title="Waiting for the host" text="Your request is with the host. Keep this tab open — we'll let you in automatically." />}
+        {screen === 'denied' && <StatusCard icon={<X size={25} />} title="Request declined" text="The host didn't approve your request this time." action={<button className="secondary-button" onClick={() => { setScreen('join'); setError(''); }}>Try again</button>} />}
+        {screen === 'ended' && <StatusCard icon={<PhoneOff size={25} />} title="Meeting ended" text={error || 'This meeting has finished.'} action={<button className="secondary-button" onClick={() => { setScreen('home'); setError(''); }}>Back to home</button>} />}
       </main>
-      <footer className="room-controls"><button className={`btn btn-icon ${mic ? 'btn-secondary' : 'active-off'}`} onClick={toggleMic}>{mic ? <Mic size={20}/> : <MicOff size={20}/>}</button><button className={`btn btn-icon ${cam ? 'btn-secondary' : 'active-off'}`} onClick={toggleCam}>{cam ? <VideoIcon size={20}/> : <VideoOff size={20}/>}</button><button className="btn btn-icon btn-danger" onClick={() => leaveMeeting()}><PhoneOff size={20}/></button>{host && <button className="btn btn-danger" style={{ width: 'auto', padding: '0.65rem 1.25rem' }} onClick={endMeeting}>End Meeting</button>}</footer>
-    </div>}
-  </div>;
+    </div>
+  );
 }
 
-function Tile({ name, stream, local = false, cam = true, mic = true, status }) {
-  const ref = useRef(null);
+function ErrorBox({ text }) {
+  return <div className="error-box">{text}</div>;
+}
+
+function StatusCard({ icon, title, text, action }) {
+  return <section className="center-layout"><div className="status-card"><div className="status-icon">{icon}</div><h2>{title}</h2><p>{text}</p>{action}</div></section>;
+}
+
+function MeetingRoom({ name, host, roomId, localStream, remoteStreams, participants, peerStatus, remoteIds, tileCount, mic, cam, pending, copied, onCopy, onToggleMic, onToggleCam, onLeave, onEnd, onAllow, onDeny }) {
+  const [showRequests, setShowRequests] = useState(true);
+  const connected = Object.values(peerStatus).filter((s) => s === 'connected').length;
+  const gridClass = useMemo(() => `meeting-grid tiles-${Math.min(tileCount, 4)}`, [tileCount]);
+
+  return (
+    <div className="meeting-shell">
+      <header className="meeting-topbar">
+        <div className="meeting-brand"><span className="brand-mark small"><Video size={16} /></span><span>Primora<span className="brand-accent">X</span></span></div>
+        <div className="meeting-meta"><span className="status-live"><span className="live-dot" /> Live</span><span className="room-label">{roomId}</span><span className="people-count"><Users size={15} /> {tileCount}</span></div>
+        <button className="invite-button" onClick={onCopy}>{copied ? <Check size={16} /> : <Copy size={16} />} {copied ? 'Copied' : 'Invite'}</button>
+      </header>
+
+      <main className="meeting-stage">
+        <div className={gridClass}>
+          <VideoTile stream={localStream} name={`${name} (You)`} local cam={cam} mic={mic} status="connected" />
+          {remoteIds.map((id) => (
+            <VideoTile
+              key={id}
+              stream={remoteStreams[id]}
+              name={participants[id]?.displayName || 'Participant'}
+              host={participants[id]?.isHost}
+              local={false}
+              cam={Boolean(remoteStreams[id])}
+              mic={true}
+              status={peerStatus[id] || 'connecting'}
+            />
+          ))}
+        </div>
+
+        {host && pending.length > 0 && showRequests && (
+          <aside className="request-popover">
+            <div className="request-head"><div><strong>Join requests</strong><span>{pending.length} waiting</span></div><button onClick={() => setShowRequests(false)}><X size={17} /></button></div>
+            {pending.map((request) => (
+              <div className="request-row" key={request.id}>
+                <div className="request-avatar">{request.displayName?.charAt(0)?.toUpperCase() || 'P'}</div>
+                <div className="request-person"><strong>{request.displayName}</strong><span>wants to join</span></div>
+                <div className="request-actions"><button className="approve" onClick={() => onAllow(request.id)}><UserCheck size={16} /></button><button className="reject" onClick={() => onDeny(request.id)}><UserX size={16} /></button></div>
+              </div>
+            ))}
+          </aside>
+        )}
+        {host && pending.length > 0 && !showRequests && <button className="request-bubble" onClick={() => setShowRequests(true)}><Users size={16} /> {pending.length} request{pending.length > 1 ? 's' : ''}</button>}
+
+        <div className="connection-pill"><span className={`connection-dot ${connected > 0 ? 'good' : ''}`} /> {connected > 0 ? `${connected} connected` : tileCount === 1 ? 'Waiting for people' : 'Connecting...'}</div>
+      </main>
+
+      <footer className="meeting-controls">
+        <div className="control-group">
+          <ControlButton active={mic} onClick={onToggleMic} icon={mic ? <Mic /> : <MicOff />} label={mic ? 'Mute' : 'Unmute'} />
+          <ControlButton active={cam} onClick={onToggleCam} icon={cam ? <Video /> : <VideoOff />} label={cam ? 'Camera' : 'Camera off'} />
+          <ControlButton active icon={<MonitorUp />} label="Share" disabled />
+        </div>
+        <button className="leave-button" onClick={onLeave}><PhoneOff size={19} /><span>Leave</span></button>
+        {host && <button className="end-button" onClick={onEnd}>End meeting</button>}
+      </footer>
+    </div>
+  );
+}
+
+function ControlButton({ icon, label, active, onClick, disabled }) {
+  return <button className={`control-button ${active ? '' : 'off'}`} onClick={onClick} disabled={disabled}><span>{icon}</span><small>{label}</small></button>;
+}
+
+function VideoTile({ stream, name, host, local, cam, mic, status }) {
+  const videoRef = useRef(null);
+  const [needsPlay, setNeedsPlay] = useState(false);
+
   useEffect(() => {
-    const video = ref.current;
-    if (!video || !stream) return;
+    const video = videoRef.current;
+    if (!video || !stream) return undefined;
     video.srcObject = stream;
-    const play = () => video.play().catch(() => {});
-    if (video.readyState >= 2) play(); else video.onloadedmetadata = play;
+    const play = () => video.play().then(() => setNeedsPlay(false)).catch(() => setNeedsPlay(true));
+    video.onloadedmetadata = play;
+    play();
     return () => { video.onloadedmetadata = null; };
   }, [stream]);
-  const initial = name?.replace(' (You)', '').charAt(0).toUpperCase() || 'P';
-  return <div className="video-card" style={{ position: 'relative' }}>
-    {stream && cam ? <video ref={ref} autoPlay playsInline muted={local} className={`video-element ${local ? 'video-mirror' : ''}`}/> : <div className="avatar-placeholder"><div className="avatar-circle">{initial}</div></div>}
-    <div className="participant-badge"><span>{name}</span>{!mic && <MicOff size={13} color="#ef4444"/>}</div>
-    {!local && !stream && <div style={{ position: 'absolute', top: 10, left: 10, background: 'rgba(0,0,0,.65)', borderRadius: 8, padding: '4px 8px', fontSize: 12 }}>{status === 'failed' ? 'Connection failed' : 'Connecting…'}</div>}
-  </div>;
+
+  const initial = name?.replace(' (You)', '').trim().charAt(0).toUpperCase() || 'P';
+  const live = Boolean(stream && cam);
+
+  return (
+    <article className={`video-tile ${local ? 'local-tile' : ''}`}>
+      {live ? <video ref={videoRef} autoPlay playsInline muted={local} className={local ? 'mirrored' : ''} onClick={() => videoRef.current?.play().catch(() => {})} /> : <div className="avatar-view"><div className="avatar-large">{initial}</div><span>{status === 'failed' ? 'Connection failed' : status === 'connecting' ? 'Connecting…' : 'Camera off'}</span></div>}
+      <div className="tile-shade" />
+      <div className="tile-label"><span className="tile-name">{name}{host && <Shield size={13} />}</span><span className="tile-mic">{mic ? <Mic size={13} /> : <MicOff size={13} />}</span></div>
+      {needsPlay && !local && <button className="tap-audio" onClick={() => videoRef.current?.play().then(() => setNeedsPlay(false))}>Tap to play audio</button>}
+    </article>
+  );
 }
